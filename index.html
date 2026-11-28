@@ -2246,13 +2246,42 @@ body.keyboard-open .font-warn{display:none!important}
     return layer;
   }
 
+  // 协战专用：把蒙版每个不透明像素**向下**延伸 px 行，左右/顶部边界不动。
+  // 牌框是在卡图之后画的，多铺出来的那段会完整压在牌框实体之下，绝不会
+  // 溢出到卡外；但能把「卡图底边与牌框白色区顶边弧线之间那条半透明渐变带」
+  // 以及蝴蝶结上方的 V 形凹口彻底填掉 —— 这正是用户反复反馈、调卡图
+  // 偏移/缩放也永远消不掉的那块缺口（蒙版是固定的，与卡图参数无关）。
+  function expandMaskDown(maskCv, px) {
+    const w = maskCv.width, h = maskCv.height;
+    const ctx = maskCv.getContext('2d', { willReadFrequently: true });
+    const d = ctx.getImageData(0, 0, w, h);
+    const a = d.data;
+    const orig = new Uint8ClampedArray(a.length);
+    orig.set(a);
+    for (let dy = 1; dy <= px; dy++) {
+      for (let y = h - 1; y >= dy; y--) {
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4 + 3, j = ((y - dy) * w + x) * 4 + 3;
+          if (orig[j] > a[i]) a[i] = orig[j];
+        }
+      }
+    }
+    ctx.putImageData(d, 0, 0);
+    return maskCv;
+  }
+
   function applyArtMask(layer, maskKey) {
     const src = R.masks[maskKey];
     if (!src) return Promise.resolve(layer);
     return loadImage(src).then(mask => {
+      const mc = newCanvas(CARD, CARD);
+      mc.getContext('2d').drawImage(mask, 0, 0, CARD, CARD);
+      // 运行时补足，不依赖 resources.js 里蒙版是哪一代（旧弧形底板 /
+      // HD 牌框内区 / 旧牌框蒙版都一律生效），兼容旧存档与旧资源包。
+      if (maskKey === 'reinforce_norm_duo') expandMaskDown(mc, 20);
       const ctx = layer.getContext('2d');
       ctx.globalCompositeOperation = 'destination-in';
-      ctx.drawImage(mask, 0, 0, CARD, CARD);
+      ctx.drawImage(mc, 0, 0);
       ctx.globalCompositeOperation = 'source-over';
       return layer;
     });
@@ -2301,8 +2330,13 @@ body.keyboard-open .font-warn{display:none!important}
     const artLayer = await buildArtworkLayer(card);
     // 协战卡图改用作者给的 267×328 弧形底版（顶部圆拱凸起、底部波浪 +
     // 蝴蝶结缺口），比旧 floodfill 矩形蒙版更贴近官方整卡示例。
-    const maskKey = (card.type === '协战' && R.masks.reinforce_norm_duo)
-      ? 'reinforce_norm_duo' : stem;
+    // 蒙版必须与**实际使用的牌框**配套：旧牌框走 reinforce_norm（本就铺到
+    // 512 底），HD 牌框走 reinforce_norm_duo（floodfill 内区 + 运行时下补）。
+    // 以前无论用哪张牌框都硬套 duo 蒙版，两套弧线不一致就会永远缺一块。
+    const maskKey = card.type === '协战'
+      ? (useHd && R.masks.reinforce_norm_duo ? 'reinforce_norm_duo'
+         : (R.masks.reinforce_norm ? 'reinforce_norm' : stem))
+      : stem;
     await applyArtMask(artLayer, maskKey);
     ctx.drawImage(artLayer, 0, 0);
     ctx.drawImage(frame, ax, (CARD - fh) / 2, fw, fh);
@@ -5092,15 +5126,21 @@ body.keyboard-open .font-warn{display:none!important}
     };
     $('previewIsland').onclick = togglePreview;
     $('previewFoldBtn').onclick = () => setPreviewCollapsed(true);
-    $('btnFullscreen').onclick = () => {
-      if (!lastCanvas) return;
+    $('btnFullscreen').onclick = async () => {
+      const c = card(); if (!c) return;
       const stage = $('ovStage'); stage.innerHTML = '';
-      const cv = document.createElement('canvas'); cv.width = lastCanvas.width; cv.height = lastCanvas.height;
-      cv.getContext('2d').drawImage(lastCanvas, 0, 0); cv.style.maxWidth = '100%'; cv.style.maxHeight = '100%';
+      // 以前直接拷贝编辑页的 lastCanvas：rAF 合帧还没落地、或刚调完卡图
+      // 就点全屏，看到的就是上一帧旧图，怎么调参数都「不变」。
+      // 现在按当前数据强制重绘一张 full canvas，所见即最新。
+      let cv;
+      try { cv = await BWP.renderCard(c, { full: true }); }
+      catch (e) { if (!lastCanvas) return; cv = lastCanvas; }
+      cv.style.maxWidth = '100%'; cv.style.maxHeight = '100%';
       stage.appendChild(cv);
-      $('ovTitle').textContent = (card() ? card().name : '卡面') + ' · 预览';
+      lastCanvas = cv;
+      $('ovTitle').textContent = c.name + ' · 预览';
       $('overlay').classList.add('show');
-      $('ovSave').onclick = () => exportCardPng(cv, (card() ? (card().id || card().name) : 'card') + '.png', 'fullscreen');
+      $('ovSave').onclick = () => exportCardPng(cv, (c.id || c.name || 'card') + '.png', 'fullscreen');
     };
     $('ovClose').onclick = () => $('overlay').classList.remove('show');
     $('btnExportPng').onclick = () => {
